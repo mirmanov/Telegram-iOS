@@ -220,4 +220,114 @@ end:
     return true;
 }
 
++ (void)repack:(NSString * _Nonnull)path to:(NSString * _Nonnull)outPath start_time:(double)start_time {
+
+    const char *in_filename, *out_filename;
+    in_filename  = [path UTF8String];
+    out_filename = [outPath UTF8String];
+
+    AVFormatContext *input_format_context = NULL;
+    AVFormatContext *output_format_context = NULL;
+    AVInputFormat *input_format = av_find_input_format("mp4");
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "max_analyze_duration", "5000000", 0);
+    av_dict_set(&options, "probesize", "5000000", 0);
+
+    if (avformat_open_input(&input_format_context, in_filename, input_format, &options) < 0) {
+        fprintf(stderr, "Could not open input file: %s\n", in_filename);
+        return;
+    }
+
+    if (avformat_find_stream_info(input_format_context, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information\n");
+        avformat_close_input(&input_format_context);
+        return;
+    }
+
+    avformat_alloc_output_context2(&output_format_context, NULL, "mp4", out_filename);
+    if (!output_format_context) {
+        fprintf(stderr, "Could not create output context\n");
+        avformat_close_input(&input_format_context);
+        return;
+    }
+
+    for (unsigned int i = 0; i < input_format_context->nb_streams; i++) {
+        AVStream *input_stream = input_format_context->streams[i];
+        AVStream *output_stream = avformat_new_stream(output_format_context, NULL);
+        if (!output_stream) {
+            fprintf(stderr, "Failed to allocate output stream\n");
+            avformat_free_context(output_format_context);
+            avformat_close_input(&input_format_context);
+            return;
+        }
+
+        if (avcodec_parameters_copy(output_stream->codecpar, input_stream->codecpar) < 0) {
+            fprintf(stderr, "Failed to copy codec parameters\n");
+            avformat_free_context(output_format_context);
+            avformat_close_input(&input_format_context);
+            return;
+        }
+
+        output_stream->codecpar->codec_tag = 0;
+        output_stream->time_base = input_stream->time_base;
+        output_stream->start_time = start_time * (double)input_stream->time_base.den / (double)input_stream->time_base.num;
+
+        if (input_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && input_stream->codecpar->extradata_size > 0) {
+            output_stream->codecpar->extradata = av_malloc(input_stream->codecpar->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            memcpy(output_stream->codecpar->extradata, input_stream->codecpar->extradata, input_stream->codecpar->extradata_size);
+            output_stream->codecpar->extradata_size = input_stream->codecpar->extradata_size;
+        }
+    }
+
+    if (avio_open(&output_format_context->pb, out_filename, AVIO_FLAG_WRITE) < 0) {
+        fprintf(stderr, "Could not open output file: %s\n", out_filename);
+        avformat_free_context(output_format_context);
+        avformat_close_input(&input_format_context);
+        return;
+    }
+    
+    AVDictionary* opts = NULL;
+    
+    av_dict_set(&opts, "muxdelay", "0", 0);
+    av_dict_set(&opts, "muxpreload", "0", 0);
+    av_dict_set(&opts, "fflags", "+genpts", 0);
+    
+    if (avformat_write_header(output_format_context, &opts) < 0) {
+        fprintf(stderr, "Error occurred when writing header to output file\n");
+        avio_closep(&output_format_context->pb);
+        avformat_free_context(output_format_context);
+        avformat_close_input(&input_format_context);
+        return;
+    }
+
+    AVPacket packet;
+    while (av_read_frame(input_format_context, &packet) >= 0) {
+        AVStream *input_stream = input_format_context->streams[packet.stream_index];
+        if (packet.stream_index >= output_format_context->nb_streams) {
+            av_packet_unref(&packet);
+            continue;
+        }
+
+        AVStream *output_stream = output_format_context->streams[packet.stream_index];
+        packet.pts = av_rescale_q(packet.pts, input_stream->time_base, output_stream->time_base);
+        packet.dts = av_rescale_q(packet.dts, input_stream->time_base, output_stream->time_base);
+        packet.duration = av_rescale_q(packet.duration, input_stream->time_base, output_stream->time_base);
+        packet.pos = -1;
+
+        if (av_interleaved_write_frame(output_format_context, &packet) < 0) {
+            fprintf(stderr, "Error writing frame\n");
+            break;
+        }
+
+        av_packet_unref(&packet);
+    }
+
+    av_write_trailer(output_format_context);
+    avio_closep(&output_format_context->pb);
+    avformat_free_context(output_format_context);
+    avformat_close_input(&input_format_context);
+
+    printf("Successfully repacked %s into %s\n", in_filename, out_filename);
+}
+
 @end
